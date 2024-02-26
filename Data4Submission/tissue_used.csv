@@ -1,0 +1,29 @@
+﻿Tissue,UBERON,# RNASeq and Genotyped samples,# RNASeq Samples
+Artery Aorta,1496,387,432
+Artery Coronary,1621,213,240
+Artery Tibial,7610,584,663
+Brain Amygdala,1876,129,152
+Brain Anterior cingulate cortex (BA24),9835,147,176
+Brain Caudate (basal ganglia),1873,194,246
+Brain Cerebellar Hemisphere,2037,175,215
+Brain Cerebellum,2037,209,241
+Brain Cortex,1870,205,255
+Brain Frontal Cortex (BA9),9834,175,209
+Brain Hippocampus,1954,165,197
+Brain Hypothalamus,1898,170,202
+Brain Nucleus accumbens (basal ganglia),1882,202,246
+Brain Putamen (basal ganglia),1874,170,205
+Brain Spinal cord (cervical c-1),6469,126,159
+Brain Substantia nigra,2038,114,139
+Breast Mammary Tissue,8367,396,459
+Colon Sigmoid,1159,318,373
+Colon Transverse,1157,368,406
+Heart Atrial Appendage,6631,372,429
+Heart Left Ventricle,6566,386,432
+Kidney Cortex,1225,73,85
+Lung,8952,515,578
+Muscle Skeletal,11907,706,803
+Ovary,992,167,180
+Prostate,2367,221,245
+Testis,473,322,361
+Whole Blood,13756,670,755

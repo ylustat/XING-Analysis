@@ -1,0 +1,534 @@
+---
+title: "Analysis on trans-associations"
+author: "Yihao Lu"
+date: "7/12/2021"
+output: html_document
+---
+
+# read in GWAS and select significant SNPs (P<5E-8) from GWAS Catalog
+```{r}
+library(data.table)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/GTEx_data")
+load("simplified_annotated_full_GWAS.RData")
+trait_list <- SNP_list %>% group_by(`DISEASE/TRAIT`) %>% summarise(n = n()) %>% arrange(desc(n)) %>% filter(n >= 100)
+SNP_list <- apply(trait_list, 1, function(x) SNP_list %>% filter(`DISEASE/TRAIT` == x[1]))
+trait_list$`DISEASE/TRAIT` <- trait_list$`DISEASE/TRAIT` %>% 
+  str_replace_all(" ","_") %>% str_replace_all("/","_") %>% str_replace_all("[(]|[)]","_") %>% 
+  str_replace_all("[']","")
+
+setwd("/scratch/t.phs.yihaolu/LLR/trans_eQTL/")
+write.table(trait_list, file = "trait_list.txt", col.names = T, row.names = F, quote = F)
+for (i in 1:length(SNP_list)) {
+  write.table(SNP_list[[i]]$variant_id,
+              file=paste0("GWAS/SNP_list/",trait_list[i,1],".txt"),
+              row.names = F,col.names = F,quote = F)
+}
+
+dict <- do.call("rbind",SNP_list)
+dict <- dict %>% select(SNPS, variant_id) %>% distinct_all()
+write.table(dict, file = "GWAS/SNP_dict.txt",row.names = F,col.names = F,quote = F)
+```
+
+```{r}
+setwd("/scratch/t.phs.yihaolu/LLR/trans_eQTL/")
+trait_list <- read.table("trait_list.txt",h=T)
+trait_list <- trait_list[c(2,3,5,6,8,10,11,12,13,17,23,24,25,28:30,31:nrow(trait_list)),]
+write.table(trait_list, file = "trait_list.txt", col.names = T, row.names = F, quote = F)
+```
+
+## generate bfile of GTEx data
+```{bash}
+cd /scratch/t.phs.yihaolu/map_eQTL
+plink --vcf /gpfs/data/linchen-lab/Yihao/mQTL_mapping/Genotypes/bfile_GTEx_MAF0_01.vcf.gz --make-bed --out /scratch/t.phs.yihaolu/LLR/trans_eQTL/bfile_GTEx
+
+plink --bfile /scratch/t.phs.yihaolu/LLR/trans_eQTL/bfile_GTEx --maf 0.01 --make-bed --out /scratch/t.phs.yihaolu/LLR/trans_eQTL/bfile_GTEx_MAF0_01
+```
+
+## only keep significant SNPs in bfile
+# revise_chr_bfile.R
+```{r}
+# change the first column of bim file
+library(data.table)
+args <- commandArgs(trailingOnly = T)
+trait = args[1] # trait = "Cardiovascular_disease"
+setwd("/scratch/t.phs.yihaolu/LLR/trans_eQTL/vcf")
+bim <- fread(paste0(trait,"_bfile.bim"))
+bim$V1 <- 1
+fwrite(bim, file = paste0(trait,"_bfile.bim"),sep="\t",col.names = F, row.names = F)
+```
+
+# revise_expression.R
+```{r}
+# change the first column of expression file
+library(data.table)
+args <- commandArgs(trailingOnly = T)
+tissue = args[1]
+outpath="/scratch/t.phs.yihaolu/LLR/trans_eQTL/expression"
+setwd("/scratch/t.phs.yihaolu/map_eQTL/GTEx_Analysis_v8_eQTL_expression_matrices/")
+expr <- fread(paste0("zcat ",tissue,".v8.normalized_expression.bed.gz"))
+expr$`#chr` <- "chr1"
+
+gene_list = read.table("/scratch/t.phs.yihaolu/LLR/trans_mQTL/cpg_gene_cor/gene.txt")
+expr <- expr[expr$gene_id %in% unlist(gene_list),]
+expr <- expr[order(expr$start),]
+setwd(outpath)
+fwrite(expr, file = paste0(tissue,".v8.normalized_expression_reindex.bed"),sep="\t",col.names = T, row.names = F)
+system(paste0("bgzip ",tissue,".v8.normalized_expression_reindex.bed"," && tabix -p bed ",tissue,".v8.normalized_expression_reindex.bed.gz"))
+```
+
+```{bash}
+for tissue in Adipose_Subcutaneous Brain_Spinal_cord_cervical_c-1 Nerve_Tibial Adipose_Visceral_Omentum Brain_Substantia_nigra Ovary Adrenal_Gland Breast_Mammary_Tissue Pancreas Artery_Aorta Cells_Cultured_fibroblasts Pituitary Artery_Coronary Cells_EBV-transformed_lymphocytes Prostate Artery_Tibial Colon_Sigmoid Skin_Not_Sun_Exposed_Suprapubic Brain_Amygdala Colon_Transverse Skin_Sun_Exposed_Lower_leg Brain_Anterior_cingulate_cortex_BA24 Esophagus_Gastroesophageal_Junction Small_Intestine_Terminal_Ileum Brain_Caudate_basal_ganglia Esophagus_Mucosa Spleen Brain_Cerebellar_Hemisphere Esophagus_Muscularis Stomach Brain_Cerebellum Heart_Atrial_Appendage Testis Brain_Cortex Heart_Left_Ventricle Thyroid Brain_Frontal_Cortex_BA9 Kidney_Cortex Uterus Brain_Hippocampus Liver Vagina Brain_Hypothalamus Lung Whole_Blood Brain_Nucleus_accumbens_basal_ganglia Minor_Salivary_Gland Brain_Putamen_basal_ganglia Muscle_Skeletal; do
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL/
+Rscript revise_expression.R $tissue
+done
+```
+
+# map trans-eQTLs
+## match_eQTL.sh
+```{bash}
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL
+module load plink/1.90
+trait=$1
+
+# plink --bfile bfile_GTEx_MAF0_01 --extract GWAS/SNP_list/$trait.txt --make-bed --out vcf/${trait}_bfile
+Rscript revise_chr_bfile.R $trait
+plink --bfile vcf/${trait}_bfile --recode vcf-iid --out vcf/${trait}
+
+awk '{if($0 !~ /^#/) print "chr"$0; else print $0}' vcf/${trait}.vcf > vcf/${trait}_tmp.vcf
+cat vcf/${trait}_tmp.vcf > vcf/${trait}.vcf
+rm vcf/${trait}_tmp.vcf
+
+cat vcf/${trait}.vcf | awk '$1 ~ /^#/ {print $0;next} {print $0 | "sort -k1,1 -k2,2n"}' > vcf/${trait}.temp.vcf
+mv vcf/${trait}.temp.vcf vcf/${trait}.vcf
+bgzip vcf/${trait}.vcf && tabix -p vcf vcf/${trait}.vcf.gz
+
+####################################
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL/script
+trait=$1
+geno_path=/scratch/t.phs.yihaolu/LLR/trans_eQTL/vcf/${trait}.vcf.gz
+outpath=/scratch/t.phs.yihaolu/LLR/trans_eQTL/output
+chr=1
+
+for tissue in Artery_Aorta Artery_Coronary Artery_Tibial Adipose_Subcutaneous Adipose_Visceral_Omentum Brain_Spinal_cord_cervical_c-1  Brain_Substantia_nigra Ovary Breast_Mammary_Tissue Prostate Cells_Cultured_fibroblasts Cells_EBV-transformed_lymphocytes Colon_Sigmoid Colon_Transverse Skin_Not_Sun_Exposed_Suprapubic Brain_Amygdala  Skin_Sun_Exposed_Lower_leg Brain_Anterior_cingulate_cortex_BA24 Esophagus_Gastroesophageal_Junction Esophagus_Mucosa Esophagus_Muscularis Brain_Caudate_basal_ganglia Brain_Cerebellar_Hemisphere Brain_Cerebellum Heart_Atrial_Appendage Testis Brain_Cortex Heart_Left_Ventricle Brain_Frontal_Cortex_BA9 Kidney_Cortex Brain_Hippocampus Brain_Hypothalamus Lung Whole_Blood Brain_Nucleus_accumbens_basal_ganglia Brain_Putamen_basal_ganglia Muscle_Skeletal; do  echo "
+#PBS -l mem=5gb
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL
+module load fastqtl/2.184_gtex
+exp_path=/scratch/t.phs.yihaolu/LLR/trans_eQTL/expression/$tissue.v8.normalized_expression_reindex.bed.gz
+cov_path=/scratch/t.phs.yihaolu/map_eQTL/GTEx_Analysis_v8_eQTL_covariates/$tissue.v8.covariates.txt
+fastQTL --vcf $geno_path \
+        --bed \$exp_path \
+        --cov \$cov_path \
+        --region chr${chr}:0-1000000000 \
+        --window 1e9 \
+        --out ${outpath}/${trait}_${tissue}.txt.gz" > fastqtl_${tissue}_${trait}.sh
+        qsub fastqtl_${tissue}_${trait}.sh; done
+```
+
+```{r}
+# run for traits/diseases we selected
+setwd("/scratch/t.phs.yihaolu/LLR/trans_eQTL/")
+# trait_file_df <- read.table("trait_list.txt",h=T)
+
+trait_file_df <- read.csv("/home/yihaolu/XING/trait_disease_used.csv")
+for (i in 1:nrow(trait_file_df)) {
+  print(i)
+  system(paste0("sh match_eQTL.sh ",as.character(trait_file_df[i,4])))
+}
+```
+
+
+# Integrate data from different tissue types
+## integration.R
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/LLR/trans_eQTL/output")
+args <- commandArgs(trailingOnly = T)
+trait = as.character(args[1])
+tissue_list <- c("Artery_Aorta","Artery_Coronary","Artery_Tibial",
+                 "Adipose_Subcutaneous","Adipose_Visceral_Omentum",
+                 "Brain_Spinal_cord_cervical_c-1","Brain_Substantia_nigra",
+                 "Ovary","Breast_Mammary_Tissue","Prostate","Cells_Cultured_fibroblasts",
+                 "Cells_EBV-transformed_lymphocytes","Colon_Sigmoid","Colon_Transverse",
+                 "Skin_Not_Sun_Exposed_Suprapubic","Brain_Amygdala","Skin_Sun_Exposed_Lower_leg",
+                 "Brain_Anterior_cingulate_cortex_BA24","Esophagus_Gastroesophageal_Junction",
+                 "Esophagus_Mucosa","Esophagus_Muscularis","Brain_Caudate_basal_ganglia",
+                 "Brain_Cerebellar_Hemisphere","Brain_Cerebellum",
+                 "Heart_Atrial_Appendage","Testis","Brain_Cortex","Heart_Left_Ventricle",
+                 "Brain_Frontal_Cortex_BA9","Kidney_Cortex","Brain_Hippocampus",
+                 "Brain_Hypothalamus","Lung","Whole_Blood","Brain_Nucleus_accumbens_basal_ganglia",
+                 "Brain_Putamen_basal_ganglia","Muscle_Skeletal")[c(1:3,6:10,13:14,16,18,22:37)]
+beta <- pvalue <- se <- df <- list()
+for (tissue in 1:length(tissue_list)) {
+  print(paste0("tissue = ",tissue))
+  df[[tissue]] <- fread(cmd = paste0("zcat ",trait,"_",tissue_list[tissue],".txt.gz"))
+  
+  df[[tissue]] <- df[[tissue]] %>% mutate(zscore = V8/V9) %>% select(V1:V2,zscore)
+}
+
+df <- Reduce(function(x, y) inner_join(x, y, by=c("V1","V2")), df)
+
+colnames(df) <- c("cpg","variant_id",tissue_list)
+fwrite(df, file = paste0("../zscore_mat/",trait,"_",tissue_list[tissue],".txt"),sep = "\t",col.names = T,row.names = F)
+rm(df)
+```
+## integration.sh
+```{bash}
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL/script
+echo "
+#PBS -l mem=${2}gb
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL
+Rscript integration.R $1" > integration_$1.sh
+qsub integration_$1.sh
+```
+## submit jobs
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+# trait_file_df <- read.table("/scratch/t.phs.yihaolu/LLR/trans_eQTL/trait_list.txt",h=T)
+trait_file_df <- read.csv("/home/yihaolu/XING/trait_disease_used.csv")
+setwd("/scratch/t.phs.yihaolu/LLR/trans_eQTL/script")
+for (td in (1:nrow(trait_file_df))) {
+  if(!file.exists(paste0("../zscore_mat/",trait_file_df[td,4],".txt")) & 
+     file.exists(paste0("../output/",trait_file_df[td,4],"_Whole_Blood.txt.gz"))) {
+    print(td)
+    size <- file.info(paste0("../output/",trait_file_df[td,4],"_Whole_Blood.txt.gz"))$size %>% 
+      utils:::format.object_size("Gb") %>% strsplit(" Gb") %>% as.numeric()
+    print(size)
+    cmd <- paste0("sh ../integration.sh ",trait_file_df[td,4]," ",10+ceiling(size * 35))
+    system(cmd)    
+  }
+}
+```
+
+
+# mQTL
+```{bash}
+cp -r /gpfs/data/linchen-lab/Yihao/mQTL_mapping/Covariates /scratch/t.phs.yihaolu/LLR/trans_mQTL/
+
+cp /gpfs/data/linchen-lab/Yihao/mQTL_mapping/Phenotypes/* /scratch/t.phs.yihaolu/LLR/trans_mQTL/methylation/original/
+
+cp -r /gpfs/data/linchen-lab/Yihao/mQTL_mapping/support_files /scratch/t.phs.yihaolu/LLR/trans_mQTL/
+
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL/Covariates
+mv BreastMammaryTissue.covariates.txt Breast_Mammary_Tissue.covariates.txt
+mv ColonTransverse.covariates.txt Colon_Transverse.covariates.txt
+mv MuscleSkeletal.covariates.txt Muscle_Skeletal.covariates.txt
+mv KidneyCortex.covariates.txt Kidney_Cortex.covariates.txt
+mv WholeBlood.covariates.txt Whole_Blood.covariates.txt
+
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL/support_files/
+mv BreastMammaryTissue.mQTL.samples.txt Breast_Mammary_Tissue.mQTL.samples.txt
+mv ColonTransverse.mQTL.samples.txt Colon_Transverse.mQTL.samples.txt
+mv MuscleSkeletal.mQTL.samples.txt Muscle_Skeletal.mQTL.samples.txt
+mv KidneyCortex.mQTL.samples.txt Kidney_Cortex.mQTL.samples.txt
+mv WholeBlood.mQTL.samples.txt Whole_Blood.mQTL.samples.txt
+```
+
+# revise tissue
+revise_methylation.R
+```{r}
+# change the first column of expression file
+args <- commandArgs(trailingOnly = T)
+tissue = args[1]
+library(data.table)
+outpath="/scratch/t.phs.yihaolu/LLR/trans_mQTL/methylation/revised"
+setwd("/scratch/t.phs.yihaolu/LLR/trans_mQTL/methylation/original")
+expr <- fread(paste0("zcat ",tissue,".bed.gz"))
+expr$`#chr` <- "chr1"
+cpg <- read.table("../../cpg_gene_cor/cpg.txt")
+
+expr <- expr[expr$gene_id %in% unlist(cpg),]
+expr <- expr[order(expr$start),]
+setwd(outpath)
+fwrite(expr, file = paste0(tissue,".reindex.bed"),sep="\t",col.names = T, row.names = F)
+system(paste0("bgzip ",tissue,".reindex.bed"," && tabix -p bed ",tissue,".reindex.bed.gz"))
+```
+
+revise_methylation.sh
+```{bash}
+for tissue in Ovary Breast_Mammary_Tissue Colon_Transverse Testis Prostate Kidney_Cortex Lung Whole_Blood Muscle_Skeletal; do
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL/
+Rscript revise_methylation.R $tissue
+done
+```
+
+# map trans-mQTLs
+## match_mQTL.sh
+```{bash}
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL/script
+trait=$1
+geno_path=/scratch/t.phs.yihaolu/LLR/trans_eQTL/vcf/${trait}.vcf.gz
+outpath=/scratch/t.phs.yihaolu/LLR/trans_mQTL/output
+chr=1
+
+for tissue in Ovary Breast_Mammary_Tissue Colon_Transverse Testis Prostate Kidney_Cortex Lung Whole_Blood Muscle_Skeletal; do  echo "
+#PBS -l mem=2gb
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL
+module load fastqtl/2.184_gtex
+exp_path=/scratch/t.phs.yihaolu/LLR/trans_mQTL/methylation/revised/$tissue.reindex.bed.gz
+cov_path=/scratch/t.phs.yihaolu/LLR/trans_mQTL/Covariates/$tissue.covariates.txt
+sample_path=/scratch/t.phs.yihaolu/LLR/trans_mQTL/support_files/$tissue.mQTL.samples.txt
+fastQTL --vcf $geno_path \
+        --bed \$exp_path \
+        --cov \$cov_path \
+        --region chr${chr}:0-1000000000 \
+        --window 1e9 \
+        --include-samples \$sample_path\
+        --out ${outpath}/${trait}_${tissue}.txt.gz" > fastqtl_${tissue}_${trait}.sh
+        qsub fastqtl_${tissue}_${trait}.sh; done
+```
+
+```{r}
+# run for traits/diseases we selected
+setwd("/scratch/t.phs.yihaolu/LLR/trans_mQTL/script")
+# trait_file_df <- read.table("../../trans_eQTL/trait_list.txt",h=T)
+trait_file_df <- read.csv("/home/yihaolu/XING/trait_disease_used.csv")
+for (i in rev(1:nrow(trait_file_df))) {
+  print(i)
+  if(!file.exists(paste0("/scratch/t.phs.yihaolu/LLR/trans_mQTL/zscore_mat/",trait_file_df[i,4],"_Whole_Blood.txt"))) {
+    system(paste0("sh ../match_mQTL.sh ",as.character(trait_file_df[i,4])))
+  }
+}
+```
+
+# Integrate data from different tissue types
+## integration.R
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/LLR/trans_mQTL/output")
+args <- commandArgs(trailingOnly = T)
+trait = as.character(args[1])
+tissue_list <- c("Breast_Mammary_Tissue","Kidney_Cortex","Muscle_Skeletal","Prostate","Testis","Colon_Transverse","Lung","Ovary","Whole_Blood")
+
+beta <- pvalue <- se <- zscore <-  list()
+for (tissue in 1:length(tissue_list)) {
+  print(paste0("tissue = ",tissue))
+  df <- fread(cmd = paste0("zcat ",trait,"_",tissue_list[tissue],".txt.gz"))
+  pvalue[[tissue]] <- df$V7
+  beta[[tissue]] <- df$V8
+  se[[tissue]] <- df$V9
+  zscore[[tissue]] <- df$V8 / df$V9
+}
+
+zscore <- do.call("cbind",zscore)
+zscore <- data.frame(df[,1:2],zscore)
+colnames(zscore) <- c("cpg","variant_id",tissue_list)
+fwrite(zscore, file = paste0("../zscore_mat/",trait,"_",tissue_list[tissue],".txt"),sep = "\t",col.names = T,row.names = F)
+
+```
+## integration.sh
+```{bash}
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL/script
+echo "
+#PBS -l mem=${2}gb
+#PBS -l walltime=120:00:00
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL
+Rscript integration.R $1" > integration_$1.sh
+qsub integration_$1.sh
+```
+## submit jobs
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+# trait_file_df <- read.table("/scratch/t.phs.yihaolu/LLR/trans_eQTL/trait_list.txt",h=T)
+trait_file_df <- read.csv("/home/yihaolu/XING/trait_disease_used.csv")
+
+setwd("/scratch/t.phs.yihaolu/LLR/trans_mQTL/script")
+for (td in (1:nrow(trait_file_df))) {
+  if(!file.exists(paste0("../zscore_mat/",trait_file_df[td,4],"_Whole_Blood.txt")) & 
+     file.exists(paste0("../output/",trait_file_df[td,4],"_Colon_Transverse.txt.gz"))) {
+    print(td)
+    size <- file.info(paste0("../output/",trait_file_df[td,4],"_Colon_Transverse.txt.gz"))$size %>% 
+      utils:::format.object_size("Gb") %>% strsplit(" Gb") %>% as.numeric()
+    print(size)
+    cmd <- paste0("sh ../integration.sh ",trait_file_df[td,4]," ",5+ceiling(size * 30))
+    system(cmd)    
+  }
+}
+```
+split.sh
+```{bash}
+echo "
+#PBS -l mem=2gb
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL/zscore_mat
+awk -F\"_|\t\"  '{print>\"${1}_\"\$2".txt"}' ${1}_Whole_Blood.txt
+" > spilt_m$1.sh
+qsub spilt_m$1.sh
+
+echo "
+#PBS -l mem=2gb
+cd /scratch/t.phs.yihaolu/LLR/trans_eQTL/zscore_mat
+awk -F\"_|\t\"  '{print>\"${1}_\"\$2".txt"}' ${1}_Muscle_Skeletal.txt
+" > spilt_e$1.sh
+qsub spilt_e$1.sh
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/LLR/trans_mQTL/script")
+disease_trait_list <- read.csv("/scratch/t.phs.yihaolu/LLR/trait_disease_used.csv")
+list_to_use = disease_trait_list[,4]
+for (td in (1:length(list_to_use))) {  # 
+  cmd <- paste0("sh ../split.sh ",list_to_use[td])
+  system(cmd)
+}
+```
+# run Algorithm
+## run_LLR.R
+```{r}
+args <- commandArgs(trailingOnly = T)
+trait = as.character(args[1])
+pc0 = as.numeric(args[2])
+chr = as.numeric(args[3])
+prior = as.numeric(args[4])
+
+setwd("/scratch/t.phs.yihaolu/LLR/")
+library("MASS")
+library("data.table")
+source('FDR_func.R')
+source('AlgorithmsHeir1.R')
+source('HierarchicalLLRAlg3-4_1.R')
+source("CCA.R")
+
+cpg_gene <- fread("trans_mQTL/cpg_gene_cor/gene_cpg_df.txt")
+gene_info <- fread("/scratch/t.phs.yihaolu/GTEx_data/gene_info_GTEx_v8.txt")
+gene_info <- gene_info %>% dplyr::select(gene_id,Chr)
+if(chr != "total") {
+  cpg_gene <- cpg_gene %>% 
+  inner_join(gene_info, by = c("gene" = "gene_id"))
+} else {
+  cpg_gene <- cpg_gene %>% 
+  inner_join(gene_info, by = c("gene" = "gene_id"))
+}
+
+eQTL <- fread(paste0("trans_eQTL/zscore_mat/zscore_from_pval/",trait,"_chr",chr))
+eQTL <- eQTL %>% filter(V1 %in% cpg_gene$gene)
+mQTL <- fread(paste0("trans_mQTL/zscore_mat/zscore_from_pval/",trait,"_chr",chr))
+
+colnames(mQTL) <- c("cpg","variant_id","Breast_Mammary_Tissue","Kidney_Cortex","Muscle_Skeletal","Prostate","Testis","Colon_Transverse","Lung","Ovary","Whole_Blood")
+mQTL <- mQTL %>% filter(cpg %in% cpg_gene$cpg)
+
+colnames(eQTL)[1:2] <- c("gene","variant_id")
+colnames(eQTL)[-c(1:2)] <-  c("Artery_Aorta","Artery_Coronary","Artery_Tibial",
+                   "Adipose_Subcutaneous","Adipose_Visceral_Omentum",
+                   "Brain_Spinal_cord_cervical_c-1","Brain_Substantia_nigra",
+                   "Ovary","Breast_Mammary_Tissue","Prostate","Cells_Cultured_fibroblasts",
+                   "Cells_EBV-transformed_lymphocytes","Colon_Sigmoid","Colon_Transverse",
+                   "Skin_Not_Sun_Exposed_Suprapubic","Brain_Amygdala","Skin_Sun_Exposed_Lower_leg",
+                   "Brain_Anterior_cingulate_cortex_BA24","Esophagus_Gastroesophageal_Junction",
+                   "Esophagus_Mucosa","Esophagus_Muscularis","Brain_Caudate_basal_ganglia",
+                   "Brain_Cerebellar_Hemisphere","Brain_Cerebellum",
+                   "Heart_Atrial_Appendage","Testis","Brain_Cortex","Heart_Left_Ventricle",
+                   "Brain_Frontal_Cortex_BA9","Kidney_Cortex","Brain_Hippocampus",
+                   "Brain_Hypothalamus","Lung","Whole_Blood","Brain_Nucleus_accumbens_basal_ganglia",
+                   "Brain_Putamen_basal_ganglia","Muscle_Skeletal")[c(1:3,6:10,13:14,16,18,22:37)]
+
+eQTL <- na.omit(eQTL)
+mQTL <- na.omit(mQTL)
+
+eQTL_mQTL <- eQTL %>% 
+  inner_join(cpg_gene, by = "gene") %>% 
+  inner_join(mQTL, by = c("cpg","variant_id"))
+
+info <- eQTL_mQTL %>% dplyr::select(gene, cpg, variant_id)
+eQTL <- eQTL_mQTL %>% dplyr::select(Artery_Aorta:Muscle_Skeletal.x)
+mQTL <- eQTL_mQTL %>% dplyr::select(Breast_Mammary_Tissue.y:Whole_Blood.y)
+rm(eQTL_mQTL)
+
+eQTL <- data.matrix(eQTL)
+mQTL <- data.matrix(mQTL)
+cov_beta_eQTL <- solve(cov(eQTL))
+cov_beta_mQTL <- solve(cov(mQTL))
+Alg1_eQTL <- Alg1(betahat = eQTL,
+                  Lambda = cov_beta_eQTL,
+                  iterT = 5,
+                  bound=1e-12, pi_init=prior,vk_init=prior)
+Alg1_mQTL <- Alg1(betahat = mQTL,
+                  Lambda = cov_beta_mQTL,
+                  iterT = 5,
+                  bound=1e-12, pi_init=prior,vk_init=prior)
+Alg4_mQTL_eQTL <- Alg4(betahat1 = eQTL,
+                       betahat2 = mQTL,
+                       Lambda1 = cov_beta_eQTL,
+                       Lambda2 = cov_beta_mQTL,
+                       CC=pc0,
+                       PC1 = pc0,
+                       PC2 = pc0,
+                       results_alg1_dat1=Alg1_eQTL,
+                       results_alg1_dat2=Alg1_mQTL,
+                       results_alg2_dat1=Alg1_eQTL,
+                       results_alg2_dat2=Alg1_mQTL,
+                       iterT = 3,
+                       bound=1e-12)
+
+fwrite(Alg4_mQTL_eQTL$alphajkm2_dat1, file = paste0("trans_eQTL/result/alg4_zscore_from_pval/lowbound_",prior,"_",trait,"_",pc0,"_chr",chr,".txt"),row.names = F,col.names = F,quote = F,sep = "\t")
+fwrite(Alg4_mQTL_eQTL$alphajkm2_dat2, file = paste0("trans_mQTL/result/alg4_zscore_from_pval/lowbound_",prior,"_",trait,"_",pc0,"_chr",chr,".txt"),row.names = F,col.names = F,quote = F,sep = "\t")
+```
+## run_LLR.sh
+```{bash}
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL/script
+echo "
+#PBS -l mem=${5}gb
+#PBS -l walltime=120:00:00
+cd /scratch/t.phs.yihaolu/LLR/trans_mQTL
+Rscript run_LLR.R $1 $2 $3 $4" > run_LLR_${1}_${2}_${3}_${4}.sh
+qsub run_LLR_${1}_${2}_${3}_${4}.sh
+```
+
+# replication - trans
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+disease_trait_list <- read.csv("/scratch/t.phs.yihaolu/LLR/trait_disease_used.csv")
+list_to_use = disease_trait_list[,4]
+bound <- "1e-06"
+gene_info <- fread("/scratch/t.phs.yihaolu/GTEx_data/gene_info_GTEx_v8.txt") %>% 
+  select(gene_id,gene_symbol,Chr,TSS) %>% 
+  distinct_at(vars(gene_symbol),.keep_all = T)
+Gen <- fread("/scratch/t.phs.yihaolu/eQTLGen/trans.txt")
+Gen <- Gen %>% 
+  inner_join(gene_info,by = c("GeneSymbol" = "gene_symbol")) %>% 
+  mutate(new.start = floor(TSS/1e6))
+Gen <- Gen %>% mutate(index = 1:n())
+lookup <- fread("/scratch/t.phs.yihaolu/eQTLGen/lookup.txt")
+
+setwd("/scratch/t.phs.yihaolu/LLR/trans_tissue/")
+res <- list()
+for (i in 1:length(list_to_use)) {
+  filename <- paste0(list_to_use[i],".all.tissue_",bound,".txt")
+  if(file.exists(filename)) {
+    res[[i]] <- fread(filename,fill=T)
+    res[[i]] <- res[[i]] %>% mutate(trait = list_to_use[i])
+  }
+}
+res_df <- res %>% 
+  do.call("rbind",.) %>% 
+  inner_join(lookup,by="variant_id")
+res_df <- res_df %>% inner_join(gene_info,by=c("gene"="gene_id"))
+res <- res_df %>%  mutate(gene = sapply(strsplit(res_df$gene,"[.]"),function(x) x[1]))
+
+Gen1 <- Gen[Gen$SNP%in%res$rsid,]
+Gen1 <- Gen1[Gen1$Gene%in%res$gene,]
+res <- res %>% filter(!is.na(eQTL_tissue) & eQTL_tissue!="")
+res_join <- res %>% 
+  inner_join(Gen1,by=c("rsid"="SNP","gene"="Gene"))
+
+res_join <- res_join %>% 
+  distinct_at(vars(rsid,gene),.keep_all = T)
+
+fisher.test(matrix(c(sum(res_join$FDR<0.05),sum(res_join$FDR>0.05),
+                     sum(Gen[!Gen$index%in%res_join$index,]$FDR<0.05),
+                     sum(Gen[!Gen$index%in%res_join$index,]$FDR>0.05)),nrow = 2,byrow = F))
+```
+
+

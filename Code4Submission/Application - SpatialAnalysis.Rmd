@@ -1,0 +1,741 @@
+---
+title: "spatial_data"
+author: "Yihao Lu"
+date: 9/11/2021"
+output: html_document
+---
+# run_BPglm.R
+```{r}
+args <- commandArgs(trailingOnly = T)
+j = as.numeric(args[1]) # index of sample
+i = as.numeric(args[2]) # index of layer
+library(Seurat)
+library(BPSC)
+library(SingleCellExperiment)
+library(ggplot2)
+id <- c("151507", "151508", "151509", "151510",
+        "151669", "151670", "151671", "151672",
+        "151673", "151674", "151675", "151676")
+setwd("/scratch/t.phs.yihaolu/single_cell/")
+
+layer <- ifelse(i<=6,paste0("Layer",i),"WM")
+dlpfc <- readRDS(paste0(id[j],".rds"))
+
+idx = rownames(dlpfc)
+data = logcounts(dlpfc)[idx,]
+bp.mat = as.matrix(data)
+
+group=rep(2,length(colData(dlpfc)$layer_guess_reordered))
+group[which(colData(dlpfc)$layer_guess_reordered == layer)] <- 1
+group[which(colData(dlpfc)$layer_guess_reordered != layer)] <- 2
+
+controlIds=which(group==2)
+design=model.matrix(~group)
+
+res1=BPglm(data=bp.mat, controlIds=controlIds, 
+           design=design, coef=2, estIntPar=FALSE, 
+           useParallel=F,keepFit = T)
+
+pval <- res1$PVAL
+zscore <- res1$TVAL
+beta <- as.vector(sapply(res1$fitRes[1:nrow(bp.mat)*8-2],function(x) {
+  if(!is.na(x)) { 
+    if(nrow(coefficients(summary(x))) >= 2) {
+      return(coefficients(summary(x))[2,1])
+    } else {
+      return(NA)
+    }
+  } else {
+    return(NA)
+  }
+}))
+df <- data.frame(gene = names(pval), sample = j, group = i, beta = beta, pval = pval, zscore=zscore)
+save(df, file = paste0("result/BPglm_sample_manual_",j,"_group_",i,".RData"))
+```
+
+submit the jobs
+```{bash}
+cd /scratch/t.phs.yihaolu/single_cell/script
+for sample in {1..12}; do
+for group in {1..7}; do echo "
+#PBS -l mem=15gb
+cd /scratch/t.phs.yihaolu/single_cell
+Rscript run_BPglm.R $sample $group " > run_BPglm_${sample}_${group}.sh
+qsub run_BPglm_${sample}_${group}.sh;done;done
+```
+
+# Extract the coefficients
+```{r}
+library(tidyverse)
+library(dplyr)
+setwd("/scratch/t.phs.yihaolu/single_cell/")
+for (j in 1:12) {
+  print(j)
+  df_list <- list()
+  if(j%in%c(5:8)) {
+      for (i in 3:7) {
+        load(paste0("result/BPglm_sample_manual_",j,"_group_",i,".RData"))
+        df_list[[i-2]] <- df
+      }
+    colname = c("gene",paste0("Layer",3:6),"WM")
+  } else {
+      for (i in 1:7) {
+        load(paste0("result/BPglm_sample_manual_",j,"_group_",i,".RData"))
+        df_list[[i]] <- df
+      }
+    colname = c("gene",paste0("Layer",1:6),"WM")
+  }
+
+
+  beta <- lapply(df_list, function(x) x[,c("gene","beta")])
+  beta <- Reduce(function(x, y) full_join(x, y, by="gene"), beta)
+  pval <- lapply(df_list, function(x) x[,c("gene","pval")])
+  pval <- Reduce(function(x, y) full_join(x, y, by="gene"), pval)
+  zscore <- lapply(df_list, function(x) x[,c("gene","zscore")])
+  zscore <- Reduce(function(x, y) full_join(x, y, by="gene"), zscore)
+  
+  colnames(zscore) <- colnames(beta) <- colnames(pval) <- colname
+  apply(beta,2,function(x) sum(!is.na(x)))
+  
+  na_index <- which(rowSums(is.na(pval))==0)
+  
+  beta <- beta[na_index,]
+  pval <- pval[na_index,]
+  zscore <- zscore[na_index,]
+  print(dim(beta))
+  beta_pval <- list(beta = beta, pval = pval,zscore=zscore)
+  save(beta_pval, file = paste0("result/beta_pval_manual_sample_",j,".RData"))
+}
+```
+# get GWAS info
+```{r}
+library(data.table)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2")
+system("wget https://www.ebi.ac.uk/gwas/api/search/downloads/full")
+system("mv full full_GWAS.txt")
+system("wget https://storage.googleapis.com/gtex_analysis_v8/reference/GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.lookup_table.txt.gz") ## get annotation
+system("gzip -d GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.lookup_table.txt.gz")
+
+annotation <- fread("GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.lookup_table.txt")
+SNP_list <- fread("full_GWAS.txt")
+trait_list <- SNP_list %>% group_by(`DISEASE/TRAIT`) %>% summarise(n = n()) %>% arrange(desc(n)) %>% filter(n >= 100)
+SNP_list <- SNP_list %>% filter(`DISEASE/TRAIT` %in% trait_list$`DISEASE/TRAIT`)
+annotation <- annotation %>% dplyr::select(variant_id,chr,rs_id_dbSNP151_GRCh38p7) 
+SNP_list <- SNP_list %>% dplyr::select(`DISEASE/TRAIT`,CHR_ID,SNPS,`P-VALUE`) %>% 
+  mutate(P = as.numeric(`P-VALUE`)) %>% 
+  filter(P < 5e-8) %>% 
+  dplyr::select(SNPS)
+SNP = strsplit(SNP_list$SNP,";") %>% unlist() %>% strsplit(" x ") %>% unlist() %>% data.frame(SNP = .)
+
+annotation <- annotation %>% filter(rs_id_dbSNP151_GRCh38p7 %in% SNP$SNP)
+SNP <- SNP %>% inner_join(annotation, by = c("SNP" = "rs_id_dbSNP151_GRCh38p7")) %>% 
+  dplyr::select(variant_id) %>% distinct(variant_id) %>% arrange(variant_id)
+write.table(SNP, file = "SNP_GWAS_table.txt", sep = "\n", quote = F, row.names = F, col.names = F)
+```
+
+```{bash}
+cd /scratch/t.phs.yihaolu/GTEx_data/script
+for tissue in Adipose_Subcutaneous Brain_Spinal_cord_cervical_c-1 Nerve_Tibial Adipose_Visceral_Omentum Brain_Substantia_nigra Ovary Adrenal_Gland Breast_Mammary_Tissue Pancreas Artery_Aorta Cells_Cultured_fibroblasts Pituitary Artery_Coronary Cells_EBV-transformed_lymphocytes Prostate Artery_Tibial Colon_Sigmoid Skin_Not_Sun_Exposed_Suprapubic Brain_Amygdala Colon_Transverse Skin_Sun_Exposed_Lower_leg Brain_Anterior_cingulate_cortex_BA24 Esophagus_Gastroesophageal_Junction Small_Intestine_Terminal_Ileum Brain_Caudate_basal_ganglia Esophagus_Mucosa Spleen Brain_Cerebellar_Hemisphere Esophagus_Muscularis Stomach Brain_Cerebellum Heart_Atrial_Appendage Testis Brain_Cortex Heart_Left_Ventricle Thyroid Brain_Frontal_Cortex_BA9 Kidney_Cortex Uterus Brain_Hippocampus Liver Vagina Brain_Hypothalamus Lung Whole_Blood Brain_Nucleus_accumbens_basal_ganglia Minor_Salivary_Gland Brain_Putamen_basal_ganglia Muscle_Skeletal; do echo "
+#PBS -l mem=15gb
+cd /scratch/t.phs.yihaolu/map_eQTL/output/full_eQTL
+cat all.$tissue.tmp.txt|awk 'FNR==NR{a[\$1];next}(\$2 in a){print}' /scratch/t.phs.yihaolu/XING_NG/app2/SNP_GWAS_table.txt - > /scratch/t.phs.yihaolu/XING_NG/app2/GWAS_eQTL_${tissue}.txt
+" > match_eQTL_$tissue.sh
+qsub match_eQTL_$tissue.sh; done
+```
+
+# sort eQTL files
+```{r}
+library(data.table)
+library(tidyverse)
+library(dplyr)
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2")
+tissue_vector = c("Adipose_Subcutaneous","Brain_Spinal_cord_cervical_c-1","Nerve_Tibial",
+  "Adipose_Visceral_Omentum","Brain_Substantia_nigra","Ovary","Adrenal_Gland",
+  "Breast_Mammary_Tissue","Pancreas","Artery_Aorta","Cells_Cultured_fibroblasts",
+  "Pituitary","Artery_Coronary","Cells_EBV-transformed_lymphocytes","Prostate",
+  "Artery_Tibial","Colon_Sigmoid","Skin_Not_Sun_Exposed_Suprapubic","Brain_Amygdala",
+  "Colon_Transverse","Skin_Sun_Exposed_Lower_leg","Brain_Anterior_cingulate_cortex_BA24",
+  "Esophagus_Gastroesophageal_Junction","Small_Intestine_Terminal_Ileum",
+  "Brain_Caudate_basal_ganglia","Esophagus_Mucosa","Spleen","Brain_Cerebellar_Hemisphere",
+  "Esophagus_Muscularis","Stomach","Brain_Cerebellum","Heart_Atrial_Appendage","Testis",
+  "Brain_Cortex","Heart_Left_Ventricle","Thyroid","Brain_Frontal_Cortex_BA9","Kidney_Cortex",
+  "Uterus","Brain_Hippocampus","Liver","Vagina","Brain_Hypothalamus","Lung","Whole_Blood",
+  "Brain_Nucleus_accumbens_basal_ganglia","Minor_Salivary_Gland",
+  "Brain_Putamen_basal_ganglia","Muscle_Skeletal")
+eQTL <- list()
+for (i in 1:length(tissue_vector)) {
+  print(i)
+  eQTL[[i]] <- fread(paste0("GWAS_eQTL_",tissue_vector[i],".txt"))
+}
+
+eQTL <- eQTL %>% lapply(function(x) x <- x %>% mutate(zscore=V8/V9))
+
+
+beta_list <- lapply(eQTL, function(x) x %>% dplyr::select(c(1,2,"zscore")))
+beta <- Reduce(function(x, y) inner_join(x, y, by=c("V1","V2")), beta_list)
+colnames(beta) <- c("gene", "variant_id", tissue_vector)
+
+beta <- beta %>% select(c("gene", "variant_id","Brain_Spinal_cord_cervical_c-1","Brain_Substantia_nigra",
+                          "Brain_Amygdala","Brain_Anterior_cingulate_cortex_BA24","Brain_Caudate_basal_ganglia",
+                 "Brain_Cerebellar_Hemisphere","Brain_Cerebellum",
+                 "Brain_Cortex","Brain_Frontal_Cortex_BA9","Brain_Hippocampus",
+                 "Brain_Hypothalamus","Brain_Nucleus_accumbens_basal_ganglia",
+                 "Brain_Putamen_basal_ganglia"))
+fwrite(beta,paste0("GWAS_zscore_mat.txt"))
+
+for (i in 1:22) {
+  print(i)
+  beta_chr <- beta %>% filter(str_detect(variant_id, paste0("chr",i,"_")))
+  fwrite(beta_chr,paste0("GWAS_zscore_mat_chr",i,".txt"))
+}
+```
+
+
+```{R}
+setwd("/scratch/t.phs.yihaolu/LLR/")
+library("MASS")
+source('FDR_func.R')
+source('AlgorithmsHeir1.R')
+source('HierarchicalLLRAlg3-4_1.R')
+source("CCA.R")
+library(data.table)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2")
+args <- commandArgs(trailingOnly = T)
+sample = as.numeric(args[1])
+chr = as.numeric(args[2])
+pcinput = as.numeric(args[3])
+prior <- as.numeric(args[4])
+pcinput2 = as.numeric(args[5])
+
+beta_eQTL <- fread(paste0("GWAS_zscore_mat_chr",chr,".txt"))
+colnames(beta_eQTL)[1:2] <- c("gene","SNP") 
+beta_eQTL$gene <- sapply(strsplit(beta_eQTL$gene,"[.]"), function(x) x[1])
+
+load(paste0("/scratch/t.phs.yihaolu/single_cell/result/beta_pval_manual_sample_",sample,".RData"))
+beta_deg <- beta_pval$zscore
+pval_deg <- beta_pval$pval
+
+beta_eQTL_deg <- beta_eQTL %>% inner_join(beta_deg, by = "gene")
+beta_eQTL <- beta_eQTL_deg %>% 
+  dplyr::select(`Brain_Spinal_cord_cervical_c-1`:`Brain_Putamen_basal_ganglia`) %>% 
+  data.matrix()
+
+beta_deg <- beta_eQTL_deg %>% dplyr::select(contains("Layer"),WM) %>% data.matrix()
+gene_snp_list <- beta_eQTL_deg[,1:2]
+###############################################################
+cov_beta_eQTL <- solve(cov(beta_eQTL))
+cov_beta_deg <- solve(cov(beta_pval$zscore[,-1]))
+
+Alg1_eQTL <- Alg1(betahat = beta_eQTL,
+                  Lambda = cov_beta_eQTL,
+                  iterT = 5)
+pi_init <- colMeans(abs(beta_deg) > 1)
+Alg1_deg <- Alg1(betahat =  beta_deg,
+                 Lambda = cov_beta_deg,
+                 iterT = 5,
+                 pi_init = pi_init,
+                 vk_init = 0.1)
+
+
+pc1 = pcinput
+# missing layer, lower dimension.
+if(sample %in% c(5:8)) {
+  pc2 = 2
+  pc0 = 2
+} else {
+  pc2 = pcinput2
+  pc0 = pcinput2
+}
+Alg4_eQTL_deg <- Alg4(betahat1 = beta_eQTL,
+                      betahat2 = beta_deg,
+                      Lambda1 = cov_beta_eQTL,
+                      Lambda2 = cov_beta_deg,
+                      CC=pc0,
+                      PC1 = pc1,
+                      PC2 = pc2,
+                      results_alg1_dat1=Alg1_eQTL,
+                      results_alg1_dat2=Alg1_deg,
+                      results_alg2_dat1=Alg1_eQTL,
+                      results_alg2_dat2=Alg1_deg,
+                      iterT = 5)
+save(Alg4_eQTL_deg, file = paste0("result/",sample,"_chr",
+                                  chr,"_",pcinput,"_",pcinput2,
+                                  "_",prior,".RData"))
+
+#################################################################
+trait_vec=c("Schizophrenia","Autism")
+beta_list <- list()
+for (trait in 1:length(trait_vec)) {
+  load(paste0("/scratch/t.phs.yihaolu/single_cell/",trait_vec[trait],"_beta_49tissue.RData"))
+  beta <- cbind(beta,trait=trait_vec[trait])
+  beta_list[[trait]] <- beta
+}
+#################################################################
+load(paste0("result/",sample,"_chr",chr,"_",pcinput,"_",pcinput2,"_",prior,".RData"))
+index <- which(!duplicated(gene_snp_list$gene))
+gene_list <- rep(list(rep(list(rep(list(NA),2)),length(trait_vec))),5)
+thres2 <- 0.9
+thres1 = thres2
+print(thres2)
+chr_count <- c(trait = "all", 
+               total = nrow(Alg4_eQTL_deg$alphajkm2_dat2[index,]),
+               colSums(Alg4_eQTL_deg$alphajkm2_dat2[index,] > thres2))
+trait_sum <- list()
+
+for (i in 1:length(trait_vec)) {
+  print(i)
+  alpha1 <- data.frame(index = 1:nrow(gene_snp_list),
+                       cbind(gene_snp_list, Alg4_eQTL_deg$alphajkm2_dat1))
+  alpha2 <- data.frame(index = 1:nrow(gene_snp_list),
+                       cbind(gene_snp_list, Alg4_eQTL_deg$alphajkm2_dat2))
+  beta_trait <- beta_list[[i]][,1:2]
+  beta_trait$gene <- sapply(strsplit(beta_trait$gene,"[.]"), function(x) x[1])
+  sub_epp <- alpha1 %>% inner_join(beta_trait, by = c("gene" = "gene","SNP" = "variant_id"))
+  sub_degpp <- alpha2[sub_epp$index,]
+  
+  total_gene <- length(unique(sub_degpp[rowSums(sub_epp[,-c(1:3)]>thres1)>=2,]$gene))
+  sign_gene <- colSums(distinct_all(sub_degpp[rowSums(sub_epp[,-c(1:3)]>thres1)>=2,-c(1:3)]) > thres2)
+  
+  gene_list[[j]][[i]][[1]] <- unique(sub_degpp[rowSums(sub_epp[,-c(1:3)]>thres1)>=2,]$gene)
+  gene_list[[j]][[i]][[2]] <- data.frame(gene = sub_epp[which(rowSums(sub_epp[,-c(1:3)]>thres1)>=2),c("gene")],
+                                         sub_degpp[rowSums(sub_epp[,-c(1:3)]>thres1)>=2,-c(1:3)] > thres2) %>% distinct_all()
+  
+  trait_sum[[i]] <- c(trait = trait_vec[i],
+                      total = total_gene,
+                      sign_gene = sign_gene)
+}
+
+result <- data.frame(rbind(chr_count, do.call("rbind",trait_sum)))
+rownames(result) <- c()
+
+write.table(result, 
+            file = paste0("result/2_tissue_unique_counts_sample",
+                          sample,"_chr",chr,"_",thres2,"_",
+                          pcinput,"_",pcinput2,"_",prior,".txt"))
+
+save(gene_list, file = paste0("result/2_tissue_unique_counts_sample",
+                              sample,"_chr",chr,"_",pcinput,"_",
+                              pcinput2,"_",prior,".RData"))
+```
+
+```{bash}
+cd /scratch/t.phs.yihaolu/XING_NG/app2/script
+for sample in {1..12}; do
+for chr in {1..22}; do 
+for pcinput in 9; do 
+for prior in 2; do
+for pcinput2 in 2; do echo " 
+#PBS -l mem=5gb
+cd /scratch/t.phs.yihaolu/XING_NG/app2
+Rscript run_LLR_trait.R $sample $chr $pcinput $prior $pcinput2" > run_LLR_${sample}_${chr}_${pcinput}_${prior}_${pcinput2}.sh
+qsub run_LLR_${sample}_${chr}_${pcinput}_${prior}_${pcinput2}.sh;done;done;done;done;done
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2/result")
+result <- rep(list(rep(list(0),22)),12)
+thres <- rep(0.9,12);prior=2;pcinput=9;pcinput2=2
+for (sample in 1:12) {
+  for (chr in 1:22) {
+    filename <- paste0("2_tissue_unique_counts_sample",sample,"_chr",chr,"_",
+                       thres[sample],"_",pcinput,"_",pcinput2,"_",prior,".txt")
+    if(!file.exists(filename)) {
+      print(sample)
+      print(chr)
+    } else {
+      result[[sample]][[chr]] <- read.table(filename)
+    }
+  }
+}
+
+result <- lapply(result, function(x) {
+  lapply(x, function(y) {
+    rownames(y) <- y[,1]
+    return(y[,-1])
+    })
+})
+
+counts <- lapply(result,function(x) Reduce("+",x))
+
+########################################################
+counts_table <- lapply(counts, function(x) {
+  apply(x[,-1], 2, function(y) {
+    paste0(y,"/",x[,1])
+  })
+})
+counts_table <- lapply(1:7, function(x) lapply(counts_table,function(y) y[x,])) %>%
+  lapply(function(z) {
+    z[5:8] <- lapply(z[5:8], function(w) {
+      names(w) <- paste0("V",5:9)
+      return(w)
+    })
+    return(z)
+  })
+
+for (i in 1:length(counts_table)) {
+  for (j in 1:length(counts_table[[i]])) {
+    y <- data.frame(counts_table[[i]][[j]])
+    x <- t(y)
+    x <- data.frame(x)
+    colnames(x) <- rownames(y)
+    counts_table[[i]][[j]] <- x
+  }
+}
+
+counts_table <- lapply(counts_table,function(x) {
+  return(data.table::rbindlist(x,fill=T,use.names=TRUE))
+})
+names(counts_table) <- c("overall","scz","autism")
+
+##########################################################
+counts <- lapply(counts,function(x) {
+  x$trait <- c("All","Schizophrenia","Autism")
+  x <- x %>% relocate(trait)
+  if(ncol(x) == 9) {
+    colnames(x)[-c(1:2)] <- c(paste0("layer",1:6),"WM")
+  } else {
+    colnames(x)[-c(1:2)] <- c(paste0("layer",3:6),"WM")
+  }
+  x[,-1] <- apply(x[,-1],2,function(y) y/x$total)
+  final_mat = x
+  return(final_mat)})
+
+tpval <- matrix(NA,7,6)
+layer_name <- c(paste0("layer",1:6),"WM")
+
+overall <- scz <- autism <- list()
+for (i in 1:7) {
+  ln <- layer_name[i]
+  if(i %in% c(1,2)) {
+    overall_l2 <- sapply(counts[c(1:4,9:12)], function(x) x[1,ln])
+    scz_l2 <- sapply(counts[c(1:4,9:12)], function(x) x[2,ln])
+    autism_l2 <- sapply(counts[c(1:4,9:12)], function(x) x[3,ln])
+    names(overall_l2) <- names(scz_l2) <- 
+      names(autism_l2) <- paste0("Sample",c(1:4,9:12))
+  } else {
+    overall_l2 <- sapply(counts, function(x) x[1,ln])
+    scz_l2 <- sapply(counts, function(x) x[2,ln])
+    autism_l2 <- sapply(counts, function(x) x[4,ln])
+    names(overall_l2) <- names(scz_l2) <- 
+      names(autism_l2) <- paste0("Sample",1:12)
+  }
+    overall[[i]] <- overall_l2
+    scz[[i]] <- scz_l2
+    autism[[i]] <- autism_l2
+
+  tpval[i,1] <- t.test(autism_l2, overall_l2,paired = T,alternative = "greater")$p.value
+  tpval[i,2] <- t.test(scz_l2, overall_l2,paired = T,alternative = "greater")$p.value
+}
+rownames(tpval) <- layer_name
+colnames(tpval) <- c("autism","scz")
+
+
+library(data.table)
+process_data <- function(df) {
+  df <- lapply(df,data.frame) %>% 
+    lapply(function(x) {
+      y <- data.frame(t(x))
+      colnames(y) <- rownames(x)
+      return(y)
+      }) %>% 
+    rbindlist(fill=T,use.names=TRUE)
+  rownames(df) <- layer_name
+  return(df)
+}
+overall <- process_data(overall)
+scz <- process_data(scz)
+autism <- process_data(autism)
+
+result <- list(overall=overall,
+               scz=scz,
+               autism=autism)
+save(result, file = "../all.result.RData")
+```
+
+
+```{r}
+# SCZ related genes
+library(tidyverse)
+library(dplyr)
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2/result")
+
+freq.n <- 1
+for (disease in c("scz","asd")) {
+if(disease == "asd") {
+  i = 3
+} else if (disease == "scz") {
+  i = 1
+}
+result_df <- list()
+for (sample in 1:12) {
+  result <- rep(list(rep(list(0),22)),12)
+  thres <- rep(0.9,12);prior=2
+  pcinput = 9; pcinput2 = 2; gene_list_all <- list()
+  for (chr in 1:22) {
+    load(paste0("2_tissue_unique_counts_sample",sample,"_chr",chr,"_",pcinput,"_",pcinput2,"_",prior,".RData"))
+    gene_list_all[[chr]] <- gene_list
+  }
+  
+  j = 5 # 0.9 threshold
+  i = 3 # 1: scz, 3: ASD
+  k = 2
+  tobind <- list()
+  for (chr in 1:22) {
+    if(sample %in% 5:8) {
+      tobind[[chr]] <- gene_list_all[[chr]][[j-3]][[i]][[k]]
+    } else {
+      tobind[[chr]] <- gene_list_all[[chr]][[j]][[i]][[k]]
+    }
+    
+  }
+  result_df[[sample]] <- do.call("rbind",tobind)
+}
+
+gene_info <- data.table::fread("/scratch/t.phs.yihaolu/GTEx_data/gene_info_GTEx_v8.txt")
+gene_info <- gene_info %>% dplyr::select(gene_id, gene_symbol)
+gene_info$gene_id <- sapply(strsplit(gene_info$gene_id,"[.]"), function(x) x[1])
+result_df[c(1:4,9:12)] <- lapply(result_df[c(1:4,9:12)], function(x) {
+  colnames(x) <- c("gene",paste0("V",1:6),"WM")
+  return(x)
+})
+result_df[c(5:8)] <- lapply(result_df[c(5:8)], function(x) {
+  colnames(x) <- c("gene",paste0("V",3:6),"WM")
+  return(x)
+})
+
+genes_list_set <- list()
+
+genes <- lapply(result_df[c(1:4,9:12)],function(x) {
+  x <- x %>% filter(V2 == T)
+  return(x$gene)
+  }) %>% unlist() %>% table() %>% sort(decreasing = T) %>% data.frame()
+colnames(genes) <- c("gene","Freq")
+genes <- genes %>% inner_join(gene_info, by = c("gene" = "gene_id")) %>% filter(Freq>=freq.n)
+genes_list_set[[1]] <- genes$gene_symbol
+write.table(genes$gene_symbol, file = paste0("../layer2.",disease,".gene.txt"),row.names = F,col.names = F,quote = F)
+
+genes <- lapply(result_df,function(x) {
+  x <- x %>% filter(V5 == T)
+  return(x$gene)
+  }) %>% unlist() %>% table() %>% sort(decreasing = T) %>% data.frame()
+colnames(genes) <- c("gene","Freq")
+genes <- genes %>% inner_join(gene_info, by = c("gene" = "gene_id")) %>% filter(Freq>=freq.n)
+genes_list_set[[2]] <- genes$gene_symbol
+write.table(genes$gene_symbol, file = paste0("../layer5.",disease,".gene.txt"),row.names = F,col.names = F,quote = F)
+
+genes <- lapply(result_df,function(x) {
+  x <- x %>% filter(V6 == T)
+  return(x$gene)
+  }) %>% unlist() %>% table() %>% sort(decreasing = T) %>% data.frame()
+colnames(genes) <- c("gene","Freq")
+genes <- genes %>% inner_join(gene_info, by = c("gene" = "gene_id")) %>% filter(Freq>=freq.n)
+genes_list_set[[3]] <- genes$gene_symbol
+write.table(genes$gene_symbol, file = paste0("../layer6.",disease,".gene.txt"),row.names = F,col.names = F,quote = F)
+
+
+genes <- lapply(result_df,function(x) {
+  x <- x %>% filter(WM == T)
+  return(x$gene)
+  }) %>% unlist() %>% table() %>% sort(decreasing = T) %>% data.frame()
+colnames(genes) <- c("gene","Freq")
+genes <- genes %>% inner_join(gene_info, by = c("gene" = "gene_id")) %>% filter(Freq>=freq.n)
+genes_list_set[[4]] <- genes$gene_symbol
+write.table(genes$gene_symbol, file = paste0("../WM.",disease,".gene.txt"),row.names = F,col.names = F,quote = F)
+
+names(genes_list_set) <- c("layer2","layer5","layer6","WM")
+if(disease == "scz") {
+  df_scz <- data.frame(gene = unlist(genes_list_set[-3]),
+                       layer = rep(names(genes_list_set)[-3],lengths(genes_list_set[-3])),
+                       significant = TRUE)
+  scz_gene <- unlist(genes_list_set[-3]) 
+} else if (disease == "asd") {
+  df_asd <- data.frame(gene = unlist(genes_list_set),
+                       layer = rep(names(genes_list_set),lengths(genes_list_set)),
+                       significant = TRUE)
+  asd_gene <- unlist(genes_list_set) 
+}
+}
+
+df_scz <- df_scz %>% 
+  pivot_wider(id_cols = gene, names_from = layer, 
+              values_from = significant, values_fill = FALSE) %>% 
+  inner_join(gene_info,by=c("gene"="gene_symbol")) %>% 
+  relocate(gene_id) %>% 
+  mutate(sum.layers = rowSums(.[3:5])) %>% 
+  arrange(desc(sum.layers))
+
+df_asd <- df_asd %>% 
+  pivot_wider(id_cols = gene, names_from = layer, 
+              values_from = significant, values_fill = FALSE) %>% 
+  inner_join(gene_info,by=c("gene"="gene_symbol")) %>% 
+  relocate(gene_id) %>% 
+  mutate(sum.layers = rowSums(.[3:6])) %>% 
+  arrange(desc(sum.layers))
+
+library(xlsx)
+write.xlsx(df_scz, file="../gene_layer.xlsx", sheetName="scz")
+write.xlsx(df_asd, file="../gene_layer.xlsx", sheetName="asd", append=TRUE)
+
+
+total_df <- c(scz_gene,asd_gene) %>% table() %>% sort(decreasing = T) %>% data.frame()
+asd_df <- c(asd_gene) %>% table() %>% sort(decreasing = T) %>% data.frame()
+scz_df <- c(scz_gene) %>% table() %>% sort(decreasing = T) %>% data.frame()
+colnames(total_df) <- 
+  colnames(asd_df) <- 
+  colnames(scz_df) <- 
+  c("gene","freq")
+gene_table <- Reduce(function(x,y) inner_join(x,y,by = "gene"),list(total_df,asd_df,scz_df))
+colnames(gene_table) <- c("gene","total.layers","asd.layers","scz.layers")
+gene_table <- gene_table %>% inner_join(gene_info,by=c("gene"="gene_symbol")) %>% 
+  relocate(gene_id)
+```
+
+# add CMC data as validation
+```{r}
+library("MASS")
+library("data.table")
+library("tidyverse")
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2")
+args <- commandArgs(trailingOnly = T)
+sample = as.numeric(args[1])
+chr = as.numeric(args[2])
+pcinput = as.numeric(args[3])
+prior <- as.numeric(args[4])
+pcinput2 = as.numeric(args[5])
+
+beta_eQTL <- fread(paste0("GWAS_zscore_mat_chr",chr,".txt"))
+colnames(beta_eQTL)[1:2] <- c("gene","SNP") 
+beta_eQTL$gene <- sapply(strsplit(beta_eQTL$gene,"[.]"), function(x) x[1])
+
+load(paste0("/scratch/t.phs.yihaolu/single_cell/result/beta_pval_manual_sample_",sample,".RData"))
+beta_deg <- beta_pval$zscore
+pval_deg <- beta_pval$pval
+
+beta_eQTL_deg <- beta_eQTL %>% inner_join(beta_deg, by = "gene")
+beta_eQTL <- beta_eQTL_deg %>% 
+  dplyr::select(`Brain_Spinal_cord_cervical_c-1`:`Brain_Putamen_basal_ganglia`) %>% 
+  data.matrix()
+
+beta_deg <- beta_eQTL_deg %>% dplyr::select(contains("Layer"),WM) %>% data.matrix()
+gene_snp_list <- beta_eQTL_deg[,1:2]
+
+# load results
+load(paste0("result/",sample,"_chr",chr,"_",pcinput,"_",pcinput2,"_",prior,".RData"))
+# load CMC pvalue
+SCZ <- read.csv(paste0("/scratch/t.phs.yihaolu/DEG/CMC_SVA_includeAncestry_SCZ.vs.Control.csv"))
+gene_info <- fread("/scratch/t.phs.yihaolu/GTEx_data/gene_info_GTEx_v8.txt")
+gene_info <- gene_info %>% dplyr::select(gene_id, gene_symbol)
+pval_CMC <- SCZ %>% inner_join(gene_info, by = c("ID" = "gene_symbol")) %>% dplyr::select(gene_id,P.Value)
+colnames(pval_CMC) <- c("gene","SCZ")
+
+qval_CMC <- data.frame(pval_CMC$gene, qvalue::qvalue(pval_CMC$SCZ)$qvalue)
+colnames(qval_CMC) <- c("gene","SCZ")
+qval_CMC$gene <- sapply(strsplit(qval_CMC$gene,"[.]"), function(x) x[1])
+##################################################################
+thres1 = 0.9
+thres2 = 0.9
+res <- list()
+i = 3
+alpha1 <- data.frame(index = 1:nrow(gene_snp_list),
+                     cbind(gene_snp_list, Alg4_eQTL_deg$alphajkm2_dat1))
+alpha2 <- data.frame(index = 1:nrow(gene_snp_list),
+                     cbind(gene_snp_list, Alg4_eQTL_deg$alphajkm2_dat2))
+####################################################################
+trait_vec=c("Schizophrenia","Autism")
+beta_list <- list()
+for (trait in 1:length(trait_vec)) {
+  load(paste0("/scratch/t.phs.yihaolu/single_cell/",trait_vec[trait],"_beta_49tissue.RData"))
+  beta <- cbind(beta,trait=trait_vec[trait])
+  beta_list[[trait]] <- beta
+}
+####################################################################
+beta_trait <- beta_list[[i]][,1:2]
+beta_trait$gene <- sapply(strsplit(beta_trait$gene,"[.]"), function(x) x[1])
+sub_epp <- alpha1 %>% inner_join(beta_trait, by = c("gene" = "gene","SNP" = "variant_id"))
+
+sub_epp <- sub_epp[rowSums(sub_epp[,-c(1:3)]>thres1) >= 2,]
+
+sub_degpp <- alpha2[sub_epp$index,]
+
+gene_list <- lapply(sub_degpp[,-c(1:3)], function(x) unique(sub_degpp$gene[which(x > thres2)]))
+res <- lapply(gene_list,function(x) {
+  qval_CMC <- qval_CMC %>% filter(gene %in% x)
+})
+
+if(sample %in% 5:8) {
+  names(res) <- c(paste0("L",3:6),"WM")
+  names(gene_list) <- c(paste0("L",3:6),"WM")
+} else {
+  names(res) <- c(paste0("L",1:6),"WM")
+  names(gene_list) <- c(paste0("L",1:6),"WM")
+}
+
+save(res, file = paste0("result/CMC_result_",sample,"_chr",chr,"_",thres2,
+                        "_",pcinput,"_",pcinput2,"_",prior,".RData"))
+```
+
+# run_CMC.sh
+```{bash}
+cd /scratch/t.phs.yihaolu/XING_NG/app2/script
+for sample in {1..12}; do
+for chr in {1..22}; do 
+for pcinput in 9; do 
+for prior in 2; do
+for pcinput2 in 2; do echo " 
+#PBS -l mem=15gb
+cd /scratch/t.phs.yihaolu/XING_NG/app2
+Rscript run_CMC.R $sample $chr $pcinput $prior $pcinput2" > run_CMC_${sample}_${chr}_${pcinput}_${prior}_${pcinput2}.sh
+qsub run_CMC_${sample}_${chr}_${pcinput}_${prior}_${pcinput2}.sh;done;done;done;done;done
+```
+
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(data.table)
+setwd("/scratch/t.phs.yihaolu/XING_NG/app2")
+thres2 = 0.9; prior = 2; pcinput = 9; pcinput2 = 2
+result <- gene.list <- all.gene <- rep(list(rep(list(NA),22)),12)
+comb.result <- comb.gene <- comb.all.gene <- rep(list(rep(list(NA),7)),12)
+prop.sign.deg <- sum.sign.deg <- sum.gene <- prop.in.sign.deg <- matrix(NA,12,7)
+
+layer <- c(paste0("L",1:6),"WM")
+fdr.thres <- 0.05
+for (sample in 1:12) {
+  for (chr in 1:22) {
+    load(paste0("result/CMC_result_",sample,"_chr",chr,"_",thres2,
+                        "_",pcinput,"_",pcinput2,"_",prior,".RData"))
+    result[[sample]][[chr]] <- res
+  }
+  
+  for (i in 1:7) {
+    comb.result[[sample]][[i]] <- lapply(result[[sample]], function(x) x[layer[i]][[1]]) %>% do.call("rbind",.)
+    if((sample %in% 5:8) & (i %in% 1:2)) {
+      prop.sign.deg[sample,i] <- NA
+    } else {
+      prop.sign.deg[sample,i] <- mean(comb.result[[sample]][[i]]$SCZ<fdr.thres)
+      sum.sign.deg[sample,i] <- sum(comb.result[[sample]][[i]]$SCZ<fdr.thres)
+      sum.gene[sample,i] <- nrow(comb.result[[sample]][[i]])
+    }
+  }
+}
+
+# get the overall proportion
+SCZ <- read.csv(paste0("/scratch/t.phs.yihaolu/DEG/CMC_SVA_includeAncestry_SCZ.vs.Control.csv"))
+gene_info <- fread("/scratch/t.phs.yihaolu/GTEx_data/gene_info_GTEx_v8.txt")
+gene_info <- gene_info %>% dplyr::select(gene_id, gene_symbol)
+pval_CMC <- SCZ %>% inner_join(gene_info, by = c("ID" = "gene_symbol")) %>% dplyr::select(gene_id,P.Value)
+colnames(pval_CMC) <- c("gene","SCZ")
+
+qval_CMC <- data.frame(pval_CMC$gene, qvalue::qvalue(pval_CMC$SCZ)$qvalue)
+colnames(qval_CMC) <- c("gene","SCZ")
+qval_CMC$gene <- sapply(strsplit(qval_CMC$gene,"[.]"), function(x) x[1])
+
+# corresponding p-value
+max(pval_CMC$SCZ[qval_CMC$SCZ<fdr.thres])
+sum(qval_CMC$SCZ<fdr.thres)
+```
